@@ -81,33 +81,30 @@ jobs:
           jq -e --arg sha "$ZED_CLI_COMMIT" '.sources["zed-pkg/zed-cli"].sha == $sha' contract/source-pins.json
           jq -e --arg sha "$ZED_CLI_COMMIT" '.sources[] | select(.fullName == "zed-pkg/zed-cli") | .sha == $sha' contract/test-plan.json
 
-      - name: Enumerate required test families
+      - name: Enumerate required unit-test families
         shell: bash
         run: |
           set -euo pipefail
           listing="$(mktemp)"
           cargo test --locked --manifest-path zed-cli/Cargo.toml --lib -- --list | tee "$listing"
-          workspace_count="$(grep -Eic 'workspace' "$listing")"
-          uninstall_count="$(grep -Eic 'uninstall' "$listing")"
-          project_lock_count="$(grep -Eic 'project_lock|operation_lock' "$listing")"
+          workspace_count="$(grep -Eic 'workspace' "$listing" || true)"
+          project_lock_count="$(grep -Eic 'project_lock|operation_lock' "$listing" || true)"
+          store_lock_count="$(grep -Eic 'install_process_lock' "$listing" || true)"
           test "$workspace_count" -gt 0
-          test "$uninstall_count" -gt 0
           test "$project_lock_count" -gt 0
+          test "$store_lock_count" -ge 2
           {
             echo '## Enumerated regression families'
             echo
             echo "- workspace tests: $workspace_count"
-            echo "- uninstall tests: $uninstall_count"
             echo "- checkout-lock tests: $project_lock_count"
+            echo "- store process-lock tests: $store_lock_count"
+            echo '- uninstall/frozen restoration: black-box CLI fixture below'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run workspace graph tests
         shell: bash
         run: cargo test --locked --manifest-path zed-cli/Cargo.toml --lib workspace -- --nocapture
-
-      - name: Run uninstall and frozen-restoration tests
-        shell: bash
-        run: cargo test --locked --manifest-path zed-cli/Cargo.toml --lib uninstall -- --nocapture
 
       - name: Run checkout-local operation-lock tests
         shell: bash
@@ -116,6 +113,7 @@ jobs:
       - name: Run store process-lock release tests
         shell: bash
         run: |
+          set -euo pipefail
           cargo test --locked --manifest-path zed-cli/Cargo.toml --lib \
             store::tests::install_process_lock_blocks_without_polling_until_owner_release \
             -- --exact --nocapture
@@ -134,6 +132,98 @@ jobs:
       - name: Build exact release executable
         shell: bash
         run: cargo build --locked --release --manifest-path zed-cli/Cargo.toml --bin zed
+
+      - name: Black-box workspace uninstall and frozen restoration
+        shell: bash
+        env:
+          FIXTURE_ROOT: ${{ runner.temp }}/zed-workspace-uninstall
+          ZED_HOME: ${{ runner.temp }}/zed-workspace-uninstall-home
+        run: |
+          set -euo pipefail
+          rm -rf "$FIXTURE_ROOT" "$ZED_HOME"
+          mkdir -p "$FIXTURE_ROOT/packages/member" "$ZED_HOME"
+
+          cat >"$FIXTURE_ROOT/.zpkg.toml" <<'TOML'
+          [package]
+          org = "lock-test"
+          name = "workspace-root"
+          version = "1.0.0"
+          description = "workspace uninstall regression root"
+          license = "MIT"
+
+          [package.repository]
+          vcs = "git"
+          url = "https://example.invalid/lock-test/workspace-root"
+
+          [workspace]
+          members = ["packages/*"]
+
+          [dependencies]
+          "lock-test/member" = "^1"
+
+          [install]
+          adapter = "none"
+          TOML
+
+          cat >"$FIXTURE_ROOT/packages/member/.zpkg.toml" <<'TOML'
+          [package]
+          org = "lock-test"
+          name = "member"
+          version = "1.2.3"
+          description = "workspace-only member"
+          license = "MIT"
+
+          [package.repository]
+          vcs = "git"
+          url = "https://example.invalid/lock-test/member"
+
+          [publish]
+          exclude = []
+          TOML
+          printf 'workspace payload\n' >"$FIXTURE_ROOT/packages/member/payload.txt"
+
+          zed="$GITHUB_WORKSPACE/zed-cli/target/release/zed"
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            zed="${zed}.exe"
+          fi
+          test -x "$zed" || test -f "$zed"
+
+          export ZED_PKG_HOME="$ZED_HOME"
+          export ZED_PKG_INTERACTIVE=false
+          export ZED_PKG_INSTALL_MODE=copy
+          export ZED_PKG_ADAPTER=none
+
+          (
+            cd "$FIXTURE_ROOT"
+            "$zed" install
+          )
+          test -f "$FIXTURE_ROOT/zed_modules/lock-test/member/payload.txt"
+          test -f "$FIXTURE_ROOT/.zpkg.lock"
+          cp "$FIXTURE_ROOT/.zpkg.lock" "$FIXTURE_ROOT/retained-lock.before"
+
+          (
+            cd "$FIXTURE_ROOT"
+            "$zed" uninstall
+          )
+          test ! -e "$FIXTURE_ROOT/zed_modules/lock-test/member"
+          cmp "$FIXTURE_ROOT/.zpkg.lock" "$FIXTURE_ROOT/retained-lock.before"
+
+          export ZED_PKG_FROZEN=true
+          (
+            cd "$FIXTURE_ROOT"
+            "$zed" install
+          )
+          test -f "$FIXTURE_ROOT/zed_modules/lock-test/member/payload.txt"
+          cmp "$FIXTURE_ROOT/.zpkg.lock" "$FIXTURE_ROOT/retained-lock.before"
+
+          {
+            echo '## Black-box workspace lifecycle'
+            echo
+            echo '- workspace-only member installed without registry mutation'
+            echo '- full uninstall removed materialized projection'
+            echo '- dependency lock retained byte-for-byte'
+            echo '- frozen install restored the exact workspace projection'
+          } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Prove source checkouts remained clean
         if: always()
