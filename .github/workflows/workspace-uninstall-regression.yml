@@ -22,9 +22,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZED_CLI_COMMIT: 5d1d13119be5784f545a7d812cdfaae3ca120693
+  ZED_CLI_COMMIT: 6e229dafcee4c47f8475235eafaabbb16ce1e364
   ZED_INTERFACES_COMMIT: d1bf8ef7c88a75292cbe8d697bfd269f30d62e2b
-  ZED_LOCK_COMMIT: a0dc78d385bc3ab553d3027b427f5f1428239c9c
+  ZED_LOCK_COMMIT: 1db0da00d30fcf2e0762f50eedb1f88458020b52
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
 
@@ -78,6 +78,7 @@ jobs:
           test "$(git -C zed-cli rev-parse HEAD)" = "$ZED_CLI_COMMIT"
           grep -Fq "rev = \"$ZED_INTERFACES_COMMIT\"" zed-cli/Cargo.toml
           grep -Fq "rev = \"$ZED_LOCK_COMMIT\"" zed-cli/Cargo.toml
+          grep -Fq "#$ZED_LOCK_COMMIT" zed-cli/Cargo.lock
           jq -e --arg sha "$ZED_CLI_COMMIT" '.sources["zed-pkg/zed-cli"].sha == $sha' contract/source-pins.json
           jq -e --arg sha "$ZED_CLI_COMMIT" '.sources[] | select(.fullName == "zed-pkg/zed-cli") | .sha == $sha' contract/test-plan.json
 
@@ -106,45 +107,9 @@ jobs:
         shell: bash
         run: cargo test --locked --manifest-path zed-cli/Cargo.toml --lib workspace -- --nocapture
 
-      - name: Run checkout-local operation-lock tests
-        if: runner.os != 'Windows'
+      - name: Run complete checkout-local operation-lock tests
         shell: bash
         run: cargo test --locked --manifest-path zed-cli/Cargo.toml --lib project_lock -- --nocapture
-
-      - name: Run Windows checkout-lock tests except the isolated contention classifier
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          cargo test --locked --manifest-path zed-cli/Cargo.toml --lib project_lock -- \
-            --nocapture \
-            --skip nested_guards_keep_descriptor_ownership_until_the_last_drop
-
-      - name: Preserve the known Windows try-acquire contention defect as a sentinel
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/windows-try-acquire-contention.log"
-          set +e
-          cargo test --locked --manifest-path zed-cli/Cargo.toml --lib \
-            project_lock::tests::nested_guards_keep_descriptor_ownership_until_the_last_drop \
-            -- --exact --nocapture >"$log" 2>&1
-          status=$?
-          set -e
-          cat "$log"
-          if [[ "$status" -eq 0 ]]; then
-            echo 'Windows try-acquire contention is fixed at this exact source pin.' >>"$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          grep -Eiq 'os error 33|locked a portion of the file' "$log"
-          echo '::warning file=zed-lock/src/lib.rs::Known blocker zed-pkg/zed-lock#13 reproduced: Windows lock violation 33 is returned as a fatal try_acquire error.'
-          {
-            echo '## Known Windows blocker reproduced'
-            echo
-            echo '- zed-pkg/zed-lock#13'
-            echo '- native ERROR_LOCK_VIOLATION (33) must normalize to Ok(None)'
-            echo '- all remaining workspace, store-lock, release-build, and black-box lifecycle checks continue below'
-          } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run store process-lock release tests
         shell: bash
