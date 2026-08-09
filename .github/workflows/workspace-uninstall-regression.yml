@@ -1,0 +1,240 @@
+name: DEN-2038 workspace uninstall regression
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/workspace-uninstall-regression.yml'
+      - 'source-pins.json'
+      - 'test-plan.json'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/workspace-uninstall-regression.yml'
+      - 'source-pins.json'
+      - 'test-plan.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workspace-uninstall-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZED_CLI_COMMIT: 751358fe130e64b646844bc7d857c4cff215ca2d
+  ZED_INTERFACES_COMMIT: d1bf8ef7c88a75292cbe8d697bfd269f30d62e2b
+  ZED_LOCK_COMMIT: 1db0da00d30fcf2e0762f50eedb1f88458020b52
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  certify:
+    name: ${{ matrix.os }} workspace uninstall
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+
+    steps:
+      - name: Require immutable source pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ZED_CLI_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ZED_INTERFACES_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ZED_LOCK_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out test contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: contract
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Check out exact zed-cli candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zed-pkg/zed-cli
+          ref: ${{ env.ZED_CLI_COMMIT }}
+          path: zed-cli
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install stable Rust validation toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt,clippy
+
+      - name: Verify exact candidate dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C zed-cli rev-parse HEAD)" = "$ZED_CLI_COMMIT"
+          grep -Fq "rev = \"$ZED_INTERFACES_COMMIT\"" zed-cli/Cargo.toml
+          grep -Fq "rev = \"$ZED_LOCK_COMMIT\"" zed-cli/Cargo.toml
+          grep -Fq "#$ZED_LOCK_COMMIT" zed-cli/Cargo.lock
+          jq -e --arg sha "$ZED_CLI_COMMIT" '.sources["zed-pkg/zed-cli"].sha == $sha' contract/source-pins.json
+          jq -e --arg sha "$ZED_CLI_COMMIT" '.sources[] | select(.fullName == "zed-pkg/zed-cli") | .sha == $sha' contract/test-plan.json
+
+      - name: Enumerate required unit-test families
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          cargo test --locked --manifest-path zed-cli/Cargo.toml --lib -- --list | tee "$listing"
+          workspace_count="$(grep -Eic 'workspace' "$listing" || true)"
+          project_lock_count="$(grep -Eic 'project_lock|operation_lock' "$listing" || true)"
+          store_lock_count="$(grep -Eic 'install_process_lock' "$listing" || true)"
+          test "$workspace_count" -gt 0
+          test "$project_lock_count" -gt 0
+          test "$store_lock_count" -ge 2
+          {
+            echo '## Enumerated regression families'
+            echo
+            echo "- workspace tests: $workspace_count"
+            echo "- checkout-lock tests: $project_lock_count"
+            echo "- store process-lock tests: $store_lock_count"
+            echo '- uninstall/frozen restoration: black-box CLI fixture below'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Run workspace graph tests
+        shell: bash
+        run: cargo test --locked --manifest-path zed-cli/Cargo.toml --lib workspace -- --nocapture
+
+      - name: Run complete checkout-local operation-lock tests
+        shell: bash
+        run: cargo test --locked --manifest-path zed-cli/Cargo.toml --lib project_lock -- --nocapture
+
+      - name: Run store process-lock release tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path zed-cli/Cargo.toml --lib \
+            store::tests::install_process_lock_blocks_without_polling_until_owner_release \
+            -- --exact --nocapture
+          cargo test --locked --manifest-path zed-cli/Cargo.toml --lib \
+            store::tests::install_process_lock_is_released_when_owner_process_is_terminated \
+            -- --exact --nocapture
+
+      - name: Check formatting and strict Clippy
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --manifest-path zed-cli/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path zed-cli/Cargo.toml --lib --bin zed -- -D warnings
+
+      - name: Build exact release executable
+        shell: bash
+        run: cargo build --locked --release --manifest-path zed-cli/Cargo.toml --bin zed
+
+      - name: Black-box workspace uninstall and frozen restoration
+        shell: bash
+        env:
+          FIXTURE_ROOT: ${{ runner.temp }}/zed-workspace-uninstall
+          ZED_HOME: ${{ runner.temp }}/zed-workspace-uninstall-home
+        run: |
+          set -euo pipefail
+          rm -rf "$FIXTURE_ROOT" "$ZED_HOME"
+          mkdir -p "$FIXTURE_ROOT/packages/member" "$ZED_HOME"
+
+          cat >"$FIXTURE_ROOT/.zpkg.toml" <<'TOML'
+          [package]
+          org = "lock-test"
+          name = "workspace-root"
+          version = "1.0.0"
+          description = "workspace uninstall regression root"
+          license = "MIT"
+
+          [package.repository]
+          vcs = "git"
+          url = "https://example.invalid/lock-test/workspace-root"
+
+          [workspace]
+          members = ["packages/*"]
+
+          [dependencies]
+          "lock-test/member" = "^1"
+
+          [install]
+          adapter = "none"
+          TOML
+
+          cat >"$FIXTURE_ROOT/packages/member/.zpkg.toml" <<'TOML'
+          [package]
+          org = "lock-test"
+          name = "member"
+          version = "1.2.3"
+          description = "workspace-only member"
+          license = "MIT"
+
+          [package.repository]
+          vcs = "git"
+          url = "https://example.invalid/lock-test/member"
+
+          [publish]
+          exclude = []
+          TOML
+          printf 'workspace payload\n' >"$FIXTURE_ROOT/packages/member/payload.txt"
+
+          zed="$GITHUB_WORKSPACE/zed-cli/target/release/zed"
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            zed="${zed}.exe"
+          fi
+          test -x "$zed" || test -f "$zed"
+
+          export ZED_PKG_HOME="$ZED_HOME"
+          export ZED_PKG_INTERACTIVE=false
+          export ZED_PKG_INSTALL_MODE=copy
+          export ZED_PKG_ADAPTER=none
+
+          (
+            cd "$FIXTURE_ROOT"
+            "$zed" install
+          )
+          test -f "$FIXTURE_ROOT/zed_modules/lock-test/member/payload.txt"
+          test -f "$FIXTURE_ROOT/.zpkg.lock"
+          cp "$FIXTURE_ROOT/.zpkg.lock" "$FIXTURE_ROOT/retained-lock.before"
+
+          (
+            cd "$FIXTURE_ROOT"
+            "$zed" uninstall
+          )
+          test ! -e "$FIXTURE_ROOT/zed_modules/lock-test/member"
+          cmp "$FIXTURE_ROOT/.zpkg.lock" "$FIXTURE_ROOT/retained-lock.before"
+
+          export ZED_PKG_FROZEN=true
+          (
+            cd "$FIXTURE_ROOT"
+            "$zed" install
+          )
+          test -f "$FIXTURE_ROOT/zed_modules/lock-test/member/payload.txt"
+          cmp "$FIXTURE_ROOT/.zpkg.lock" "$FIXTURE_ROOT/retained-lock.before"
+
+          {
+            echo '## Black-box workspace lifecycle'
+            echo
+            echo '- workspace-only member installed without registry mutation'
+            echo '- full uninstall removed materialized projection'
+            echo '- dependency lock retained byte-for-byte'
+            echo '- frozen install restored the exact workspace projection'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Prove source checkouts remained clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repository in contract zed-cli; do
+            status="$(git -C "$repository" status --porcelain=v1 --untracked-files=all)"
+            if [[ -n "$status" ]]; then
+              printf 'dirty %s checkout:\n%s\n' "$repository" "$status" >&2
+            fi
+            test -z "$status"
+          done
