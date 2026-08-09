@@ -40,8 +40,8 @@
     {
       "fullName": "zed-pkg/zed-cli",
       "exists": true,
-      "branch": "chore/zed-lock-windows-contention",
-      "sha": "6e229dafcee4c47f8475235eafaabbb16ce1e364",
+      "branch": "main",
+      "sha": "751358fe130e64b646844bc7d857c4cff215ca2d",
       "visibility": "public"
     },
     {
