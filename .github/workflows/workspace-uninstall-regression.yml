@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZED_CLI_COMMIT: 6e229dafcee4c47f8475235eafaabbb16ce1e364
+  ZED_CLI_COMMIT: 751358fe130e64b646844bc7d857c4cff215ca2d
   ZED_INTERFACES_COMMIT: d1bf8ef7c88a75292cbe8d697bfd269f30d62e2b
   ZED_LOCK_COMMIT: 1db0da00d30fcf2e0762f50eedb1f88458020b52
   CARGO_TERM_COLOR: always
